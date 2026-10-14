@@ -1,0 +1,187 @@
+name: reusable / gitops-promote
+
+# Promote an already-built, already-signed image into one environment:
+#   1. verify the signature (never promote something the cluster would reject)
+#   2. copy image + signatures + attestations to that environment's ACR (same digest)
+#   3. open a PR in the GitOps repo that pins the digest in values-<env>.yaml
+#
+# The job runs in a GitHub *environment*: its OIDC subject is
+# repo:<owner>/<repo>:environment:<env>, which is the only subject the env's
+# Azure identity trusts. Required reviewers on "prod" therefore gate prod pushes.
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      image:
+        description: Source image (ghcr.io/<owner>/<name>)
+        type: string
+        required: true
+      digest:
+        type: string
+        required: true
+      version:
+        type: string
+        required: true
+      values-files:
+        description: Space-separated values files in the GitOps repo to update
+        type: string
+        required: true
+      gitops-repo:
+        type: string
+        default: gastonhp1/azure-aks-gitops-platform
+      auto-merge:
+        description: Enable auto-merge on the PR (dev). Leave false for prod.
+        type: boolean
+        default: false
+    secrets:
+      GITOPS_APP_ID:
+        required: true
+      GITOPS_APP_PRIVATE_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  promote:
+    name: promote → ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: promote-${{ inputs.environment }}-${{ inputs.image }}
+      cancel-in-progress: false # never interrupt a half-done promotion
+    permissions:
+      contents: read
+      id-token: write # Azure OIDC
+      packages: read
+    env:
+      SRC: ${{ inputs.image }}@${{ inputs.digest }}
+      IMAGE_NAME_ONLY: ${{ inputs.image }}
+      ENV_NAME: ${{ inputs.environment }}
+      VERSION: ${{ inputs.version }}
+      DIGEST: ${{ inputs.digest }}
+      GITOPS_REPO: ${{ inputs.gitops-repo }}
+      AUTO_MERGE: ${{ inputs.auto-merge }}
+    steps:
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+
+      - name: verify signature before promoting
+        run: |
+          cosign verify "$SRC" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/reusable-container.yml@refs/(heads/main|tags/v.*)$" \
+            > /dev/null
+          echo "✅ signature verified for $SRC"
+
+      - name: azure login (OIDC)
+        if: vars.ACR_LOGIN_SERVER != ''
+        uses: azure/login@7184910d9eb2b1c5e48f7073824a90609bb9b6d6 # v2.3.1
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+
+      - id: target
+        name: copy to ${{ inputs.environment }} registry
+        env:
+          ACR: ${{ vars.ACR_LOGIN_SERVER }}
+          GHCR_TOKEN: ${{ github.token }}
+        run: |
+          name="${IMAGE_NAME_ONLY##*/}"
+          if [[ -z "$ACR" ]]; then
+            echo "no ACR configured for ${ENV_NAME}: deploying straight from GHCR"
+            echo "repository=$IMAGE_NAME_ONLY" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "$GHCR_TOKEN" | cosign login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          # Exchange the Entra token for an ACR refresh token, no admin user, no password.
+          az acr login --name "${ACR%%.*}" --expose-token --output tsv --query accessToken \
+            | cosign login "$ACR" -u 00000000-0000-0000-0000-000000000000 --password-stdin
+          # cosign copy carries the signature and attestations along with the image.
+          cosign copy --force "$SRC" "$ACR/$name:${VERSION}"
+          echo "repository=$ACR/$name" >> "$GITHUB_OUTPUT"
+
+      - id: gitops
+        name: split gitops repo
+        env:
+          FULL: ${{ inputs.gitops-repo }}
+        run: |
+          echo "owner=${FULL%%/*}" >> "$GITHUB_OUTPUT"
+          echo "name=${FULL#*/}" >> "$GITHUB_OUTPUT"
+
+      # Short-lived (1h) token scoped to the GitOps repo only, minted from a
+      # GitHub App with contents+pull-requests write. No PAT tied to a person.
+      - id: app-token
+        uses: actions/create-github-app-token@fee1f7d63c2ff003460e3d139729b119787bc349 # v2.2.2
+        with:
+          app-id: ${{ secrets.GITOPS_APP_ID }}
+          private-key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
+          owner: ${{ steps.gitops.outputs.owner }}
+          repositories: ${{ steps.gitops.outputs.name }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          repository: ${{ inputs.gitops-repo }}
+          token: ${{ steps.app-token.outputs.token }}
+          path: gitops
+          persist-credentials: false
+
+      - name: pin digest in values
+        working-directory: gitops
+        env:
+          REPO: ${{ steps.target.outputs.repository }}
+          FILES: ${{ inputs.values-files }}
+        run: |
+          for f in $FILES; do
+            test -f "$f" || { echo "::error::$f not found in ${GITOPS_REPO}"; exit 1; }
+            # The local values keep pulling from GHCR; everything else uses the env registry.
+            if [[ "$f" == *values-local.yaml ]]; then repo="$IMAGE_NAME_ONLY"; else repo="$REPO"; fi
+            repo="$repo" yq -i '
+              .image.repository = strenv(repo) |
+              .image.tag = strenv(VERSION) |
+              .image.digest = strenv(DIGEST)
+            ' "$f"
+          done
+          git diff --stat
+
+      - name: open PR
+        working-directory: gitops
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          if git diff --quiet; then
+            echo "already at this digest, nothing to promote"
+            exit 0
+          fi
+          name="${IMAGE_NAME_ONLY##*/}"
+          branch="promote/${ENV_NAME}/${name}-${VERSION}"
+          gh auth setup-git # push with the short-lived app token, nothing persisted on disk
+          git config user.name  "golden-path[bot]"
+          git config user.email "golden-path[bot]@users.noreply.github.com"
+          git switch -c "$branch"
+          git commit -am "deploy(${ENV_NAME}): ${name} ${VERSION}"
+          git push --force-with-lease origin "$branch"
+
+          body=$(cat <<EOF
+          Promotes **${name}** \`${VERSION}\` to **${ENV_NAME}**.
+
+          | | |
+          |---|---|
+          | digest | \`${DIGEST}\` |
+          | source | ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID} |
+          | commit | ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA} |
+
+          Signature verified against the golden-path workflow identity before this PR was opened.
+          EOF
+          )
+          url=$(gh pr create --title "deploy(${ENV_NAME}): ${name} ${VERSION}" --body "$body" --base main --head "$branch" 2>/dev/null \
+                || gh pr view "$branch" --json url -q .url)
+          echo "PR: $url" | tee -a "$GITHUB_STEP_SUMMARY"
+          if [[ "$AUTO_MERGE" == "true" ]]; then
+            gh pr merge "$url" --auto --squash
+          fi

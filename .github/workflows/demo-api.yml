@@ -1,0 +1,80 @@
+name: demo-api
+
+# Caller pipeline for apps/demo-api, composed only of the reusable workflows:
+#
+#   PR          → ci → container (build + scan, no push)
+#   push main   → ci → container (push + sign) → promote dev (auto-merge)
+#   tag v*      → ci → container (push + sign) → promote prod (needs approval)
+on:
+  pull_request:
+    paths: ["apps/demo-api/**", ".github/workflows/demo-api.yml", ".github/workflows/reusable-*.yml"]
+  push:
+    branches: [main]
+    paths: ["apps/demo-api/**", ".github/workflows/demo-api.yml", ".github/workflows/reusable-*.yml"]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: demo-api-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ci:
+    uses: ./.github/workflows/reusable-python-ci.yml
+    with:
+      working-directory: apps/demo-api
+
+  container:
+    needs: ci
+    uses: ./.github/workflows/reusable-container.yml
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+      security-events: write
+    with:
+      image-name: demo-api
+      context: apps/demo-api
+      push: ${{ github.event_name != 'pull_request' }}
+
+  promote-dev:
+    if: github.ref == 'refs/heads/main'
+    needs: container
+    uses: ./.github/workflows/reusable-gitops-promote.yml
+    permissions:
+      contents: read
+      id-token: write
+      packages: read
+    with:
+      environment: dev
+      image: ${{ needs.container.outputs.image }}
+      digest: ${{ needs.container.outputs.digest }}
+      version: ${{ needs.container.outputs.version }}
+      values-files: gitops/apps/demo-api/values-dev.yaml gitops/apps/demo-api/values-local.yaml
+      auto-merge: true
+    secrets:
+      GITOPS_APP_ID: ${{ secrets.GITOPS_APP_ID }}
+      GITOPS_APP_PRIVATE_KEY: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
+
+  promote-prod:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: container
+    uses: ./.github/workflows/reusable-gitops-promote.yml
+    permissions:
+      contents: read
+      id-token: write
+      packages: read
+    with:
+      environment: prod # protected environment: required reviewers + tag-only deployments
+      image: ${{ needs.container.outputs.image }}
+      digest: ${{ needs.container.outputs.digest }}
+      version: ${{ needs.container.outputs.version }}
+      values-files: gitops/apps/demo-api/values-prod.yaml
+      auto-merge: false
+    secrets:
+      GITOPS_APP_ID: ${{ secrets.GITOPS_APP_ID }}
+      GITOPS_APP_PRIVATE_KEY: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}

@@ -1,0 +1,207 @@
+name: reusable / container
+
+# Build once, gate on a vulnerability scan, push a multi-arch image to GHCR,
+# then sign it and attach an SBOM and SLSA provenance, all by digest.
+#
+# The Sigstore keyless certificate identity is THIS file
+# (…/reusable-container.yml@<ref>), which is exactly what the platform's
+# Kyverno policy trusts. A signature produced anywhere else is rejected.
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: Image name without registry (e.g. demo-api)
+        type: string
+        required: true
+      context:
+        description: Docker build context
+        type: string
+        required: true
+      push:
+        description: false on pull requests (build + scan only)
+        type: boolean
+        default: true
+      platforms:
+        type: string
+        default: linux/amd64,linux/arm64
+      fail-on-severity:
+        description: Trivy severities that block the pipeline (fixable only)
+        type: string
+        default: CRITICAL,HIGH
+    outputs:
+      image:
+        description: Fully qualified image without tag (ghcr.io/<owner>/<name>)
+        value: ${{ jobs.build.outputs.image }}
+      digest:
+        description: sha256 digest of the pushed multi-arch index
+        value: ${{ jobs.build.outputs.digest }}
+      version:
+        value: ${{ jobs.build.outputs.version }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build · scan · push · sign
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write       # push to GHCR
+      id-token: write       # Sigstore keyless signing + build provenance
+      attestations: write   # GitHub artifact attestations
+      security-events: write
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+      digest: ${{ steps.push.outputs.digest }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - id: ref
+        name: image reference
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ${{ steps.ref.outputs.image }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short,prefix=sha-
+            type=ref,event=pr
+          labels: |
+            org.opencontainers.image.title=${{ inputs.image-name }}
+
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      # 1) Build for the runner's arch only and scan it BEFORE anything is pushed.
+      - name: build (scan candidate)
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: ${{ inputs.context }}
+          platforms: linux/amd64
+          load: true
+          tags: scan-candidate:${{ github.sha }}
+          build-args: |
+            APP_VERSION=${{ steps.meta.outputs.version }}
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha,scope=${{ inputs.image-name }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.image-name }}
+
+      - name: trivy (blocking gate)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: scan-candidate:${{ github.sha }}
+          severity: ${{ inputs.fail-on-severity }}
+          ignore-unfixed: true
+          exit-code: "1"
+          format: table
+
+      - name: trivy (full report → Security tab)
+        if: always()
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: scan-candidate:${{ github.sha }}
+          format: sarif
+          output: trivy-image.sarif
+          exit-code: "0"
+          skip-setup-trivy: true
+
+      - name: upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@9f759ee644a3e7c15c1390abf49868036c00067b # v3.38.3
+        with:
+          sarif_file: trivy-image.sarif
+          category: container-${{ inputs.image-name }}
+
+      - name: login to GHCR
+        if: inputs.push
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # 2) Same Dockerfile, multi-arch, served from the build cache: seconds, not minutes.
+      - id: push
+        name: build & push (multi-arch)
+        if: inputs.push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: ${{ inputs.context }}
+          platforms: ${{ inputs.platforms }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            APP_VERSION=${{ steps.meta.outputs.version }}
+            GIT_SHA=${{ github.sha }}
+          cache-from: type=gha,scope=${{ inputs.image-name }}
+          # SBOM/provenance are produced below and attached as signed attestations.
+          provenance: false
+          sbom: false
+
+      - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+        if: inputs.push
+
+      - name: cosign sign (keyless, by digest)
+        if: inputs.push
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}@${{ steps.push.outputs.digest }}
+        run: cosign sign --yes "$IMAGE"
+
+      - name: SBOM (SPDX)
+        if: inputs.push
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ${{ steps.ref.outputs.image }}@${{ steps.push.outputs.digest }}
+          format: spdx-json
+          output-file: sbom.spdx.json
+          upload-artifact: true
+
+      - name: cosign attest SBOM
+        if: inputs.push
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}@${{ steps.push.outputs.digest }}
+        run: cosign attest --yes --type spdxjson --predicate sbom.spdx.json "$IMAGE"
+
+      - name: SLSA build provenance
+        if: inputs.push
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
+        with:
+          subject-name: ${{ steps.ref.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: summary
+        if: inputs.push
+        env:
+          IMAGE_NAME: ${{ inputs.image-name }}
+          IMAGE: ${{ steps.ref.outputs.image }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          {
+            echo "### 📦 ${IMAGE_NAME}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| image | \`${IMAGE}\` |"
+            echo "| digest | \`${DIGEST}\` |"
+            echo "| tags | \`$(echo "$TAGS" | tr '\n' ' ')\` |"
+            echo ""
+            echo "Verify locally:"
+            echo '```bash'
+            echo "cosign verify ${IMAGE}@${DIGEST} \\"
+            echo "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\"
+            echo "  --certificate-identity-regexp '^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/reusable-container.yml@'"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

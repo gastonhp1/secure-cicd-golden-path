@@ -1,0 +1,64 @@
+name: reusable / python-ci
+
+# Lint, type-check, test and audit dependencies of a Python service.
+# Any repo can call it:
+#   uses: gastonhp1/secure-cicd-golden-path/.github/workflows/reusable-python-ci.yml@v1
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: Directory containing pyproject.toml
+        type: string
+        required: true
+      python-version:
+        type: string
+        default: "3.13"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: lint · types · tests · audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: ${{ inputs.python-version }}
+          cache: pip
+          cache-dependency-path: ${{ inputs.working-directory }}/pyproject.toml
+
+      - name: install
+        run: pip install -e '.[dev]' pip-audit
+
+      - name: ruff (lint)
+        run: ruff check --output-format=github .
+
+      - name: ruff (format)
+        run: ruff format --check .
+
+      - name: mypy
+        run: mypy
+
+      - name: pytest
+        run: pytest --junitxml=junit.xml
+
+      - name: pip-audit (known CVEs in dependencies)
+        # Audits the resolved environment, not just direct dependencies.
+        run: pip-audit --strict --progress-spinner off --skip-editable
+
+      - name: test report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: junit-${{ github.job }}
+          path: ${{ inputs.working-directory }}/junit.xml
+          if-no-files-found: ignore
