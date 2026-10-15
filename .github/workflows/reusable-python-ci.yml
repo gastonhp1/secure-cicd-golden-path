@@ -53,7 +53,12 @@ jobs:
 
       - name: pip-audit (known CVEs in dependencies)
         # Audits the resolved environment, not just direct dependencies.
-        run: pip-audit --strict --progress-spinner off --skip-editable
+        # The project itself is installed editable and isn't on PyPI; with
+        # --strict, --skip-editable turns that skip into an error, so audit a
+        # frozen list without it instead.
+        run: |
+          pip freeze --exclude-editable > "$RUNNER_TEMP/requirements-audit.txt"
+          pip-audit --strict --progress-spinner off --no-deps --disable-pip -r "$RUNNER_TEMP/requirements-audit.txt"
 
       - name: test report
         if: always()
