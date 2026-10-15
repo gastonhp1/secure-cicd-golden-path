@@ -7,7 +7,10 @@ WORKDIR /src
 RUN python -m venv /venv
 COPY pyproject.toml ./
 COPY src ./src
-RUN /venv/bin/pip install .
+# pip isn't needed at runtime and vendors its own urllib3/msgpack/setuptools,
+# which the scan would flag in the copied venv.
+RUN /venv/bin/pip install . \
+ && /venv/bin/pip uninstall -y pip
 
 # ---- runtime: no compilers, no pip, non-root ---------------------------------
 FROM python:3.13-slim AS runtime
