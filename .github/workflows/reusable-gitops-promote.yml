@@ -28,6 +28,10 @@ on:
         description: Space-separated values files in the GitOps repo to update
         type: string
         required: true
+      image-path:
+        description: yq path of the image block (repository/tag/digest) in the values files
+        type: string
+        default: .image
       gitops-repo:
         type: string
         default: gastonhp1/azure-aks-gitops-platform
@@ -65,16 +69,21 @@ jobs:
       DIGEST: ${{ inputs.digest }}
       GITOPS_REPO: ${{ inputs.gitops-repo }}
       AUTO_MERGE: ${{ inputs.auto-merge }}
+      IMAGE_PATH: ${{ inputs.image-path }}
     steps:
       - uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
 
+      # Same check as the cluster's Kyverno policy: signed by the golden-path
+      # container workflow (on main or a v* tag), run from the calling repo.
+      # The workflow is public, so the subject alone is not enough.
       - name: verify signature before promoting
         run: |
           cosign verify "$SRC" \
             --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            --certificate-identity-regexp "^https://github.com/${GITHUB_REPOSITORY}/.github/workflows/reusable-container.yml@refs/(heads/main|tags/v.*)$" \
+            --certificate-identity-regexp '^https://github\.com/gastonhp1/secure-cicd-golden-path/\.github/workflows/reusable-container\.yml@refs/(heads/main|tags/v.*)$' \
+            --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
             > /dev/null
-          echo "✅ signature verified for $SRC"
+          echo "✅ signature verified for $SRC (built by $GITHUB_REPOSITORY)"
 
       - name: azure login (OIDC)
         if: vars.ACR_LOGIN_SERVER != ''
@@ -141,11 +150,12 @@ jobs:
             test -f "$f" || { echo "::error::$f not found in ${GITOPS_REPO}"; exit 1; }
             # The local values keep pulling from GHCR; everything else uses the env registry.
             if [[ "$f" == *values-local.yaml ]]; then repo="$IMAGE_NAME_ONLY"; else repo="$REPO"; fi
-            repo="$repo" yq -i '
-              .image.repository = strenv(repo) |
-              .image.tag = strenv(VERSION) |
-              .image.digest = strenv(DIGEST)
-            ' "$f"
+            [[ "$IMAGE_PATH" =~ ^(\.[A-Za-z0-9_-]+)+$ ]] || { echo "::error::invalid image-path: $IMAGE_PATH"; exit 1; }
+            repo="$repo" yq -i "
+              ${IMAGE_PATH}.repository = strenv(repo) |
+              ${IMAGE_PATH}.tag = strenv(VERSION) |
+              ${IMAGE_PATH}.digest = strenv(DIGEST)
+            " "$f"
           done
           git diff --stat
 
