@@ -165,7 +165,11 @@ jobs:
           git config user.email "golden-path[bot]@users.noreply.github.com"
           git switch -c "$branch"
           git commit -am "deploy(${ENV_NAME}): ${name} ${VERSION}"
-          git push --force-with-lease origin "$branch"
+          # Re-runs reuse the branch. The single-branch checkout has no tracking
+          # ref for it ("stale info"), so lease against its current remote SHA
+          # (empty = must not exist yet).
+          expect=$(git ls-remote origin "refs/heads/$branch" | cut -f1)
+          git push --force-with-lease="refs/heads/$branch:$expect" origin "$branch"
 
           body=$(cat <<EOF
           Promotes **${name}** \`${VERSION}\` to **${ENV_NAME}**.
